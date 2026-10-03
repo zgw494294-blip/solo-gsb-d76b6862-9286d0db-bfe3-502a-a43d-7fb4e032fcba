@@ -178,7 +178,10 @@ docker compose down
 
 - `replica_ids`：2～8 个非空且唯一的副本 ID。
 - 每个事件属于其中某个副本；`seq` 从 1 开始，同一副本内不重复且必须连续
-  （事件在请求中可乱序）。
+  （事件在请求中可乱序）。缺口诊断只按**实际提交的事件**进行，缺失序号以
+  **闭区间概述**（如 `[2, 999999999999]`），绝不逐个分配、遍历或列出
+  `1..最大 seq`，因此稀疏的 `10^12` 大序号也只产生一条轻量
+  `non_contiguous_seq` 错误（422），不会耗尽内存；不设 seq 上限。
 - `put`（字符串，允许空串）与 `delete`（值必须是字符串 `"delete"`）二选一。
 - `clock` 必须覆盖**全部**副本且无多余分量，分量为非负整数；
   本副本分量必须等于本事件 `seq`。
@@ -1200,7 +1203,10 @@ curl -sS -i -G "http://localhost:8000/api/histories/$HID/withdraw-preview" \
 
 - 在写锁内读取历史**最新已提交**状态，把暂存事件按原汇入规则合并：与已提交
   事件同标识同内容的忽略，异内容 **409**；合并后重新执行原整批校验（连续性、
-  因果、依赖存在性、clock 覆盖等）与 **120 条总上限**，违例 **422**；
+  因果、依赖存在性、clock 覆盖等）与 **120 条总上限**，违例 **422**。连续性
+  校验只处理实际事件：暂存一个缺依赖的稀疏大序号（如 `10^12`）本身仍被接受，
+  但提交时返回 **422** `non_contiguous_seq`，错误中以闭区间概述缺口
+  （`[2, 999999999999]`），**不会**展开 `1..10^12` 耗尽内存，也不设 seq 上限；
 - **失败时开放会话与已暂存数据原样保留**，补齐缺失事件后可对同一会话重试；
 - 成功时汇入与封闭**在同一事务中生效**（与旧写接口并发也不会丢事件），响应
   就是历史的读取结构（`id`、`replica_ids`、排序后的完整 `events`、`results`）；
@@ -1638,6 +1644,61 @@ curl -sS "http://localhost:8000/api/histories/$HID/import-sessions/$SID/missing-
   ]
 }
 ```
+
+### 21a. 稀疏大序号提交：`10^12` 也只产生一条 422，区间概述缺口
+
+暂存允许缺依赖的大序号——即使暂存的 `r1/10^12` 与已提交的 `r1/1` 之间缺了
+`10^12 - 2` 个序号，暂存仍然成功；但**提交**时整批连续性校验必须拒绝它。
+缺口只以**闭区间**概述（`[2, 999999999999]`），服务端绝不逐个分配、遍历或
+列出 `1..10^12`，因此请求瞬间返回一条 `non_contiguous_seq` 422，而不会耗尽
+内存；系统**不设 seq 上限**。
+
+```bash
+# 历史含 r1/1（clock (r1,r2)=(1,0)）
+HID=$(curl -sS -X POST http://localhost:8000/api/histories \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "replica_ids": ["r1", "r2"],
+    "events": [
+      {"replica_id": "r1", "seq": 1, "key": "k", "put": "a",
+       "clock": {"r1": 1, "r2": 0}}
+    ]
+  }' | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+SID=$(curl -sS -X POST "http://localhost:8000/api/histories/$HID/import-sessions" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+
+# 暂存稀疏的 r1/10^12（缺依赖）——暂存接受
+curl -sS -X POST "http://localhost:8000/api/histories/$HID/import-sessions/$SID/events" \
+  -H 'Content-Type: application/json' \
+  -d '{"events": [
+    {"replica_id": "r1", "seq": 1000000000000, "key": "k", "put": "b",
+     "clock": {"r1": 1000000000000, "r2": 0}}
+  ]}' > /dev/null
+
+# 提交 -> 422，缺口只概述为一个闭区间
+curl -sS -i -X POST "http://localhost:8000/api/histories/$HID/import-sessions/$SID/commit"
+```
+
+```json
+{
+  "detail": [
+    {
+      "code": "non_contiguous_seq",
+      "message": "seqs for replica 'r1' must be unique and start at 1 with no gaps; got sorted seqs [1, 1000000000000] (missing closed interval(s): [2, 999999999999])"
+    }
+  ]
+}
+```
+
+失败提交不改任何状态：历史仍只有 `r1/1`、会话仍为 `open` 且仍暂存着
+`r1/10^12`，可随时用缺口查询核对（返回的也只是区间 `[2, 999999999999]`）。
+共用同一份整批校验的其他接口（`/api/resolve`、`/api/catchup`、
+`/api/resolve-conflict`、`POST /api/histories` 与
+`POST /api/histories/{id}/events`）对同类稀疏输入同样返回这条 422。
+
+**小缺口对照**：只缺一个序号时，区间是单点闭区间。历史含 `r1/1`、暂存
+`r1/3`，提交返回的 `non_contiguous_seq` 消息中带 `missing closed interval(s):
+[2, 2]`；把缺失的 `r1/2` 补进同一会话后再提交即成功封闭（见例 17/18）。
 
 ### 22. 同标识异内容：409 列出全部冲突，不返回清单
 

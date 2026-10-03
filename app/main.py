@@ -75,7 +75,11 @@ and 120-event rules (content mismatch 409, missing dependencies or other
 violations 422) and closes the session; the merge and the close take effect
 in the same transaction, a failed commit leaves the open session and its
 staged events untouched for a retry, and a closed session rejects further
-appends and commits with 409.  Staging never affects the history reads or
+appends and commits with 409.  Contiguity is checked from the events
+actually present -- gaps are summarised as closed intervals and the span
+is never expanded, so a staged sparse seq such as 10**12 commits as one
+cheap ``non_contiguous_seq`` 422 instead of exhausting memory; no upper
+seq bound is imposed.  Staging never affects the history reads or
 verdicts, and sessions persist in the same SQLite database, so they survive
 restarts.
 
@@ -152,7 +156,7 @@ from __future__ import annotations
 import json
 import uuid
 from collections import deque
-from typing import Annotated, Optional
+from typing import Annotated, Iterable, Optional
 
 from fastapi import FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
@@ -600,12 +604,46 @@ def _clock_le(
     return True, any_less
 
 
+def _closed_gap_ranges(
+    present: Iterable[int], upper: int
+) -> list[tuple[int, int]]:
+    """Missing numbers of the closed span ``1..upper`` as maximal closed ranges.
+
+    Given the numbers that are *present*, return the largest possible
+    contiguous runs of missing ones as ``(start, end)`` closed-interval pairs
+    sorted ascending.  Iteration is bounded solely by the present identities
+    -- never by the span itself -- so a ``10**12`` upper bound with only a
+    handful of present identities costs a handful of intervals: no missing
+    number is ever allocated, enumerated or listed one by one.
+    """
+
+    ranges: list[tuple[int, int]] = []
+    cursor = 1
+    for n in sorted(present):
+        if n > cursor:
+            ranges.append((cursor, n - 1))
+        cursor = n + 1
+    if cursor <= upper:
+        ranges.append((cursor, upper))
+    return ranges
+
+
+def _format_gap_ranges(ranges: list[tuple[int, int]]) -> str:
+    """Render closed gap intervals compactly, e.g. ``[2, 2], [4, 10**12]``."""
+
+    return ", ".join(f"[{start}, {end}]" for start, end in ranges)
+
+
 def validate_batch(
     replica_ids: list[str], events: list[Event]
 ) -> dict[tuple[str, int], Event]:
     """Validate the batch and index events by (replica_id, seq).
 
     Raises BatchError (-> 422) on any violation, pointing at event indices.
+    Every check works from the events actually present: contiguity gaps are
+    diagnosed from the per-replica seq sets and summarised as closed intervals,
+    never by expanding ``1..max(seq)``, so a sparse ``10**12`` seq is rejected
+    cheaply with one ``non_contiguous_seq`` error instead of exhausting memory.
     """
 
     errors: list[dict] = []
@@ -677,21 +715,25 @@ def validate_batch(
             seen[key] = ev
             seen_index[key] = i
 
-    # Rule 4b: per-replica seq must be a contiguous 1..N range.
+    # Rule 4b: per-replica seq must be a contiguous 1..N range.  Gaps are
+    # derived from the present seq set as closed intervals; the missing
+    # numbers (up to a 10**12-large max seq) are never themselves allocated
+    # or enumerated.
     valid_seqs: dict[str, set[int]] = {}
     for rid, seqs in seqs_by_replica.items():
         if not seqs:
             continue
         uniq = set(seqs)
         valid_seqs[rid] = uniq
-        expected = set(range(1, max(uniq) + 1))
-        if len(uniq) != len(seqs) or uniq != expected:
-            gaps = sorted(expected - uniq)
+        upper = max(uniq)
+        gap_ranges = _closed_gap_ranges(uniq, upper)
+        if len(uniq) != len(seqs) or gap_ranges:
             errors.append(
                 _err(
                     "non_contiguous_seq",
                     f"seqs for replica {rid!r} must be unique and start at 1 with no "
-                    f"gaps; got sorted seqs {sorted(seqs)} (missing {gaps})",
+                    f"gaps; got sorted seqs {sorted(seqs)} "
+                    f"(missing closed interval(s): {_format_gap_ranges(gap_ranges)})",
                 )
             )
 
@@ -1236,18 +1278,11 @@ def _session_missing_ranges(
         if upper <= 0:
             continue
         # Coalesce the gaps inside 1..upper from the present identities only;
-        # iteration is bounded by present identities, never by the (possibly
-        # 10**12-large) span itself.
-        cursor = 1
-        for n in sorted(present.get(rid, ())):
-            if n > cursor:
-                ranges.append(
-                    {"replica_id": rid, "start_seq": cursor, "end_seq": n - 1}
-                )
-            cursor = n + 1
-        if cursor <= upper:
+        # the shared helper iterates over present identities, never over the
+        # (possibly 10**12-large) span itself.
+        for start, end in _closed_gap_ranges(present.get(rid, ()), upper):
             ranges.append(
-                {"replica_id": rid, "start_seq": cursor, "end_seq": upper}
+                {"replica_id": rid, "start_seq": start, "end_seq": end}
             )
 
     ranges.sort(key=lambda r: (r["replica_id"], r["start_seq"]))

@@ -259,6 +259,118 @@ def test_seq_must_start_at_one():
     assert_422(r, "non_contiguous_seq")
 
 
+def test_non_contiguous_seq_gaps_reported_as_closed_intervals():
+    # Small-gap regression: the gap diagnosis summarises the missing seqs as
+    # closed intervals, not by listing every missing seq one by one.
+    r = post(
+        ["r1", "r2"],
+        [
+            ev("r1", 1, "k", put="a", clock={"r1": 1, "r2": 0}),
+            ev("r1", 3, "k", put="b", clock={"r1": 3, "r2": 0}),
+        ],
+    )
+    detail = assert_422(r, "non_contiguous_seq")
+    msg = detail[0]["message"]
+    assert "[2, 2]" in msg
+    # Only the interval overview is allowed for the missing numbers -- no
+    # flat enumeration list "(missing [2])".
+    assert "(missing [" not in msg
+
+
+def test_non_contiguous_seq_several_gaps_coalesce_into_intervals():
+    # Present 1, 3, 5: two singleton gaps, each its own closed interval; the
+    # gap interiors (2 and 4 here) are never enumerated as a seq list.
+    r = post(
+        ["r1", "r2"],
+        [
+            ev("r1", 1, "k", put="a", clock={"r1": 1, "r2": 0}),
+            ev("r1", 3, "k", put="b", clock={"r1": 3, "r2": 0}),
+            ev("r1", 5, "k", put="c", clock={"r1": 5, "r2": 0}),
+        ],
+    )
+    detail = assert_422(r, "non_contiguous_seq")
+    msg = detail[0]["message"]
+    assert "[2, 2]" in msg and "[4, 4]" in msg
+    assert "(missing [" not in msg
+
+
+def test_non_contiguous_seq_huge_sparse_seq_rejected_without_enumerating():
+    # A single sparse 10**12 event must be one cheap non_contiguous_seq 422;
+    # the 10**12-2 missing seqs are summarised as one closed interval and
+    # never allocated or listed (the message stays tiny).
+    huge = 10**12
+    r = post(
+        ["r1", "r2"],
+        [
+            ev("r1", 1, "k", put="a", clock={"r1": 1, "r2": 0}),
+            ev("r1", huge, "k", put="b", clock={"r1": huge, "r2": 0}),
+        ],
+    )
+    detail = assert_422(r, "non_contiguous_seq")
+    msg = detail[0]["message"]
+    assert f"[2, {huge - 1}]" in msg
+    # Sorted present seqs are still reported (there are only two actual
+    # events), but the gap interior is not enumerated.
+    assert "(missing [" not in msg
+    assert len(msg) < 400
+
+
+@pytest.mark.parametrize(
+    "endpoint, body",
+    [
+        (
+            "/api/catchup",
+            {
+                "known_clock": {"r1": 0, "r2": 0},
+                "events": [
+                    ev("r1", 1, "k", put="a", clock={"r1": 1, "r2": 0}),
+                    ev("r1", 10**12, "k", put="b",
+                       clock={"r1": 10**12, "r2": 0}),
+                ],
+            },
+        ),
+        (
+            "/api/resolve-conflict",
+            {
+                "key": "k",
+                "replica_id": "r1",
+                "versions": [
+                    {"replica_id": "r1", "seq": 1},
+                    {"replica_id": "r1", "seq": 10**12},
+                ],
+                "put": "x",
+                "events": [
+                    ev("r1", 1, "k", put="a", clock={"r1": 1, "r2": 0}),
+                    ev("r1", 10**12, "k", put="b",
+                       clock={"r1": 10**12, "r2": 0}),
+                ],
+            },
+        ),
+    ],
+    ids=["catchup", "resolve-conflict"],
+)
+def test_other_full_batch_endpoints_reject_sparse_huge_seq(endpoint, body):
+    # Every endpoint sharing the full validate_batch path must reject the same
+    # sparse input cheaply with 422/non_contiguous_seq (not 500/OOM).
+    r = client.post(endpoint, json={"replica_ids": ["r1", "r2"], **body})
+    detail = assert_422(r, "non_contiguous_seq")
+    assert f"[2, {10**12 - 1}]" in detail[0]["message"]
+
+
+def test_history_create_rejects_sparse_huge_seq():
+    r = hist_create(
+        ["r1", "r2"],
+        [
+            ev("r1", 1, "k", put="a", clock={"r1": 1, "r2": 0}),
+            ev("r1", 10**12, "k", put="b", clock={"r1": 10**12, "r2": 0}),
+        ],
+    )
+    detail = assert_422(r, "non_contiguous_seq")
+    assert f"[2, {10**12 - 1}]" in detail[0]["message"]
+    # The rejected batch never became a history.
+    assert hist_get("deadbeef" * 4).status_code == 404
+
+
 def test_clock_pointing_to_missing_event():
     # r1/1 claims to know r3/1, but no event was produced by r3.
     r = post(
@@ -2563,6 +2675,174 @@ def test_import_session_commit_missing_dependency_422_then_fix_and_retry():
     assert session_get(hid, sid).json()["status"] == "closed"
     # The second session is unaffected and still open.
     assert session_get(hid, sid2).json()["status"] == "open"
+
+
+def test_import_session_commit_sparse_huge_seq_is_422_and_changes_nothing():
+    # Regression: history holds r1/1; staging accepts a sparse r1/10^12, but
+    # the commit must reject it cheaply with 422/non_contiguous_seq -- never
+    # exhaust memory expanding 1..10^12.  History, staging and open status
+    # stay untouched for a retry.
+    hid = hist_create(
+        ["r1", "r2"],
+        [ev("r1", 1, "k", put="a", clock={"r1": 1, "r2": 0})],
+    ).json()["id"]
+    sid = create_session(hid)
+    huge = 10**12
+    assert (
+        session_append(
+            hid,
+            sid,
+            [ev("r1", huge, "k", put="b", clock={"r1": huge, "r2": 0})],
+        ).status_code
+        == 200
+    )
+
+    r = session_commit(hid, sid)
+    detail = assert_422(r, "non_contiguous_seq")
+    assert f"[2, {huge - 1}]" in detail[0]["message"]
+
+    # History, staged events and the open status are all unchanged.
+    assert [(e["replica_id"], e["seq"]) for e in hist_get(hid).json()["events"]] == [
+        ("r1", 1)
+    ]
+    session = session_get(hid, sid).json()
+    assert session["status"] == "open"
+    assert [(e["replica_id"], e["seq"]) for e in session["events"]] == [
+        ("r1", huge)
+    ]
+
+    # The existing gap query still describes the hole as one closed range.
+    r = session_missing(hid, sid)
+    assert r.json() == {
+        "missing_ranges": [
+            {"replica_id": "r1", "start_seq": 2, "end_seq": huge - 1}
+        ]
+    }
+
+    # A retry after appending the (small) missing predecessors can never fill
+    # 10^12-2 events under the 120 cap, so commit keeps rejecting -- but a
+    # distinct small gap fills and commits normally (next test).
+    r = session_commit(hid, sid)
+    assert_422(r, "non_contiguous_seq")
+    assert session_get(hid, sid).json()["status"] == "open"
+
+
+def test_import_session_commit_small_gap_is_422_with_interval_diagnosis():
+    # Small-gap regression at commit time: history r1/1, staged r1/3 -> one
+    # [2, 2] gap interval in the 422; filling r1/2 makes the retry succeed.
+    hid = hist_create(
+        ["r1", "r2"],
+        [ev("r1", 1, "k", put="a", clock={"r1": 1, "r2": 0})],
+    ).json()["id"]
+    sid = create_session(hid)
+    assert (
+        session_append(
+            hid, sid, [ev("r1", 3, "k", put="c", clock={"r1": 3, "r2": 0})]
+        ).status_code
+        == 200
+    )
+
+    r = session_commit(hid, sid)
+    detail = assert_422(r, "non_contiguous_seq")
+    assert "[2, 2]" in detail[0]["message"]
+    assert session_get(hid, sid).json()["status"] == "open"
+
+    assert (
+        session_append(
+            hid, sid, [ev("r1", 2, "k", put="b", clock={"r1": 2, "r2": 0})]
+        ).status_code
+        == 200
+    )
+    r = session_commit(hid, sid)
+    assert r.status_code == 200, r.text
+    assert session_get(hid, sid).json()["status"] == "closed"
+
+
+def test_history_merge_sparse_huge_seq_is_422_and_atomic():
+    # The legacy merge endpoint shares full-batch validation and must reject
+    # the same sparse input cheaply; the history stays at r1/1.
+    hid = hist_create(
+        ["r1", "r2"],
+        [ev("r1", 1, "k", put="a", clock={"r1": 1, "r2": 0})],
+    ).json()["id"]
+    before = hist_get(hid).json()
+
+    r = hist_merge(
+        hid,
+        [ev("r1", 10**12, "k", put="b", clock={"r1": 10**12, "r2": 0})],
+    )
+    detail = assert_422(r, "non_contiguous_seq")
+    assert f"[2, {10**12 - 1}]" in detail[0]["message"]
+    assert hist_get(hid).json() == before
+
+
+def test_sparse_huge_seq_validation_uses_no_gap_memory_under_rlimit(
+    tmp_path,
+):
+    """Hard OOM guard: under a 768 MiB address-space cap the OLD
+    ``set(range(1, 10**12 + 1))`` expansion dies (MemoryError/SIGKILL), while
+    the interval-based validation must return a 422 both statelessly and on a
+    session commit, leaving the session open."""
+
+    db = tmp_path / "history.db"
+    code = """
+import json, resource, sys
+resource.setrlimit(resource.RLIMIT_AS, (768 * 1024 * 1024, 768 * 1024 * 1024))
+from fastapi.testclient import TestClient
+from app.main import app
+
+huge = 10**12
+c = TestClient(app, raise_server_exceptions=False)
+
+# Stateless validation rejects the sparse batch with 422.
+r = c.post('/api/resolve', json={
+    'replica_ids': ['r1', 'r2'],
+    'events': [
+        {'replica_id': 'r1', 'seq': 1, 'key': 'k', 'put': 'a',
+         'clock': {'r1': 1, 'r2': 0}},
+        {'replica_id': 'r1', 'seq': huge, 'key': 'k', 'put': 'b',
+         'clock': {'r1': huge, 'r2': 0}},
+    ],
+})
+assert r.status_code == 422, r.status_code
+codes = [e.get('code') for e in r.json()['detail']]
+assert 'non_contiguous_seq' in codes, codes
+
+# Persistent path: the sparse event stages but its commit rejects under cap.
+r = c.post('/api/histories', json={
+    'replica_ids': ['r1', 'r2'],
+    'events': [{'replica_id': 'r1', 'seq': 1, 'key': 'k', 'put': 'a',
+                'clock': {'r1': 1, 'r2': 0}}],
+})
+assert r.status_code == 201, r.text
+hid = r.json()['id']
+sid = c.post(f'/api/histories/{hid}/import-sessions').json()['id']
+r = c.post(f'/api/histories/{hid}/import-sessions/{sid}/events', json={
+    'events': [{'replica_id': 'r1', 'seq': huge, 'key': 'k', 'put': 'b',
+                'clock': {'r1': huge, 'r2': 0}}],
+})
+assert r.status_code == 200, r.text
+r = c.post(f'/api/histories/{hid}/import-sessions/{sid}/commit')
+assert r.status_code == 422, r.status_code
+codes = [e.get('code') for e in r.json()['detail']]
+assert 'non_contiguous_seq' in codes, codes
+data = c.get(f'/api/histories/{hid}/import-sessions/{sid}').json()
+assert data['status'] == 'open'
+assert [(e['replica_id'], e['seq']) for e in data['events']] == [('r1', huge)]
+print('ok')
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        env=dict(
+            os.environ,
+            HISTORY_DB_PATH=str(db),
+            PYTHONPATH="/workspace",
+        ),
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
+    assert proc.stdout.strip() == "ok"
 
 
 def test_import_session_commit_content_mismatch_with_history_is_409():
