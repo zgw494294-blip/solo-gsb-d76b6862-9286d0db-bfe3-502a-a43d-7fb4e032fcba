@@ -677,21 +677,38 @@ def validate_batch(
             seen[key] = ev
             seen_index[key] = i
 
-    # Rule 4b: per-replica seq must be a contiguous 1..N range.
+    # Rule 4b: per-replica seq must be a contiguous 1..N range.  The check
+    # works solely from the seqs actually present -- it never allocates,
+    # iterates over or lists the span 1..max(seq), so a sparse batch with a
+    # 10**12 seq costs a handful of comparisons; the missing seqs are
+    # summarised as maximal contiguous closed ranges, not enumerated.
     valid_seqs: dict[str, set[int]] = {}
     for rid, seqs in seqs_by_replica.items():
         if not seqs:
             continue
         uniq = set(seqs)
         valid_seqs[rid] = uniq
-        expected = set(range(1, max(uniq) + 1))
-        if len(uniq) != len(seqs) or uniq != expected:
-            gaps = sorted(expected - uniq)
+        ordered = sorted(uniq)
+        is_contiguous_from_one = ordered[0] == 1 and all(
+            b == a + 1 for a, b in zip(ordered, ordered[1:])
+        )
+        if len(uniq) != len(seqs) or not is_contiguous_from_one:
+            gap_ranges: list[tuple[int, int]] = []
+            cursor = 1
+            for n in ordered:
+                if n > cursor:
+                    gap_ranges.append((cursor, n - 1))
+                cursor = n + 1
+            gaps_text = ", ".join(
+                f"[{start}..{end}]" if start != end else f"[{start}]"
+                for start, end in gap_ranges
+            )
             errors.append(
                 _err(
                     "non_contiguous_seq",
-                    f"seqs for replica {rid!r} must be unique and start at 1 with no "
-                    f"gaps; got sorted seqs {sorted(seqs)} (missing {gaps})",
+                    f"seqs for replica {rid!r} must be unique and start at 1 "
+                    f"with no gaps; got sorted seqs {ordered} "
+                    f"(missing closed range(s) {gaps_text})",
                 )
             )
 

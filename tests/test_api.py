@@ -259,6 +259,104 @@ def test_seq_must_start_at_one():
     assert_422(r, "non_contiguous_seq")
 
 
+def test_non_contiguous_seq_reports_missing_seqs_as_closed_ranges():
+    # Regression: the gap diagnosis must summarise the missing seqs as closed
+    # ranges instead of enumerating them one by one.
+    r = post(
+        ["r1", "r2"],
+        [
+            ev("r1", 1, "k", put="a", clock={"r1": 1, "r2": 0}),
+            ev("r1", 3, "k", put="b", clock={"r1": 3, "r2": 0}),
+        ],
+    )
+    detail = assert_422(r, "non_contiguous_seq")
+    (err,) = [e for e in detail if e["code"] == "non_contiguous_seq"]
+    assert "missing closed range(s) [2]" in err["message"]
+
+    # Several gaps are coalesced per contiguous closed range.
+    r = post(
+        ["r1", "r2"],
+        [
+            ev("r1", 1, "k", put="a", clock={"r1": 1, "r2": 0}),
+            ev("r1", 3, "k", put="b", clock={"r1": 3, "r2": 0}),
+            ev("r1", 6, "k", put="c", clock={"r1": 6, "r2": 0}),
+        ],
+    )
+    detail = assert_422(r, "non_contiguous_seq")
+    (err,) = [e for e in detail if e["code"] == "non_contiguous_seq"]
+    assert "missing closed range(s) [2], [4..5]" in err["message"]
+
+
+def test_sparse_huge_seq_rejected_without_expanding_the_gap():
+    # Regression: r1/1 and a sparse r1/10^12 must be rejected by contiguity
+    # validation without allocating or enumerating 1..10^12; the (huge) gap
+    # is summarised as one closed range and the response comes back fast.
+    huge = 10**12
+    start = time.monotonic()
+    r = post(
+        ["r1", "r2"],
+        [
+            ev("r1", 1, "k", put="a", clock={"r1": 1, "r2": 0}),
+            ev("r1", huge, "k", put="b", clock={"r1": huge, "r2": 0}),
+        ],
+    )
+    elapsed = time.monotonic() - start
+    assert r.status_code == 422, r.text
+    detail = r.json()["detail"]
+    (err,) = [e for e in detail if e["code"] == "non_contiguous_seq"]
+    assert f"missing closed range(s) [2..{huge - 1}]" in err["message"]
+    # The message stays small: the missing seqs are never listed.
+    assert len(err["message"]) < 1000
+    # Expanding the span would take far longer than a handful of comparisons.
+    assert elapsed < 5
+
+
+def test_sparse_huge_seq_rejected_on_every_full_batch_endpoint():
+    # Every endpoint sharing the full batch validation must reject the same
+    # sparse input with non_contiguous_seq.
+    huge = 10**12
+    sparse = [
+        ev("r1", 1, "k", put="a", clock={"r1": 1, "r2": 0}),
+        ev("r1", huge, "k", put="b", clock={"r1": huge, "r2": 0}),
+    ]
+
+    r = post(["r1", "r2"], sparse)
+    assert_422(r, "non_contiguous_seq")
+
+    r = post_catchup(["r1", "r2"], sparse, {"r1": 0, "r2": 0})
+    assert_422(r, "non_contiguous_seq")
+
+    r = post_resolve_conflict(
+        ["r1", "r2"],
+        sparse,
+        key="k",
+        writer="r1",
+        versions=[
+            {"replica_id": "r1", "seq": 1},
+            {"replica_id": "r2", "seq": 1},
+        ],
+        put="x",
+    )
+    assert_422(r, "non_contiguous_seq")
+
+    r = hist_create(["r1", "r2"], sparse)
+    assert_422(r, "non_contiguous_seq")
+    # The rejected create left no history behind.
+    assert hist_get("deadbeef" * 4).status_code == 404
+
+    # The legacy merge endpoint re-runs the same full validation.
+    seed_hid = hist_create(
+        ["r1", "r2"],
+        [ev("r1", 1, "k", put="a", clock={"r1": 1, "r2": 0})],
+    ).json()["id"]
+    before = hist_get(seed_hid).json()
+    r = hist_merge(
+        seed_hid, [ev("r1", huge, "k", put="b", clock={"r1": huge, "r2": 0})]
+    )
+    assert_422(r, "non_contiguous_seq")
+    assert hist_get(seed_hid).json() == before
+
+
 def test_clock_pointing_to_missing_event():
     # r1/1 claims to know r3/1, but no event was produced by r3.
     r = post(
@@ -2563,6 +2661,101 @@ def test_import_session_commit_missing_dependency_422_then_fix_and_retry():
     assert session_get(hid, sid).json()["status"] == "closed"
     # The second session is unaffected and still open.
     assert session_get(hid, sid2).json()["status"] == "open"
+
+
+def test_import_session_commit_sparse_huge_seq_is_422_and_leaves_everything_open():
+    # Regression: history contains r1/1; a session stages (legitimately,
+    # staging tolerates missing predecessors) r1/10^12.  The commit must
+    # reject the non-contiguous seq with 422 -- returning a closed-range
+    # summary instead of expanding the 1..10^12 span, which previously
+    # exhausted memory -- and leave the history, staging area and open
+    # status untouched.
+    huge = 10**12
+    hid = hist_create(
+        ["r1", "r2"],
+        [ev("r1", 1, "k", put="a", clock={"r1": 1, "r2": 0})],
+    ).json()["id"]
+    sid = create_session(hid)
+
+    # Staging the sparse big-seq event is allowed.
+    r = session_append(
+        hid, sid, [ev("r1", huge, "k", put="b", clock={"r1": huge, "r2": 0})]
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "open"
+
+    before_hist = hist_get(hid).json()
+    start = time.monotonic()
+    r = session_commit(hid, sid)
+    elapsed = time.monotonic() - start
+    assert r.status_code == 422, r.text
+    (err,) = [e for e in r.json()["detail"] if e["code"] == "non_contiguous_seq"]
+    assert f"missing closed range(s) [2..{huge - 1}]" in err["message"]
+    # The missing seqs are never enumerated: message stays small, call fast.
+    assert len(err["message"]) < 1000
+    assert elapsed < 5
+
+    # History, staging and open status are all unchanged.
+    assert hist_get(hid).json() == before_hist
+    session = session_get(hid, sid).json()
+    assert session["status"] == "open"
+    assert [(e["replica_id"], e["seq"]) for e in session["events"]] == [
+        ("r1", huge)
+    ]
+
+    # The missing-ranges query still reports the same gap as one closed
+    # range (it never expanded the span either).
+    r = session_missing(hid, sid)
+    assert r.status_code == 200, r.text
+    assert r.json() == {
+        "missing_ranges": [
+            {"replica_id": "r1", "start_seq": 2, "end_seq": huge - 1}
+        ]
+    }
+
+
+def test_import_session_commit_small_gap_is_422_and_retryable_after_filling():
+    # Small-gap counterpart of the sparse-seq regression: r1/1 committed,
+    # stage r1/3 only -> commit 422 with a one-seq closed range; fill r1/2
+    # in the same session, retry -> 200 and the session closes.
+    hid = hist_create(
+        ["r1", "r2"],
+        [ev("r1", 1, "k", put="a", clock={"r1": 1, "r2": 0})],
+    ).json()["id"]
+    sid = create_session(hid)
+    assert (
+        session_append(
+            hid, sid, [ev("r1", 3, "k", put="c", clock={"r1": 3, "r2": 0})]
+        ).status_code
+        == 200
+    )
+
+    r = session_commit(hid, sid)
+    detail = assert_422(r, "non_contiguous_seq")
+    (err,) = [e for e in detail if e["code"] == "non_contiguous_seq"]
+    assert "missing closed range(s) [2]" in err["message"]
+    assert session_get(hid, sid).json()["status"] == "open"
+    assert len(hist_get(hid).json()["events"]) == 1
+
+    # The gap query agrees on the single missing seq.
+    assert session_missing(hid, sid).json() == {
+        "missing_ranges": [{"replica_id": "r1", "start_seq": 2, "end_seq": 2}]
+    }
+
+    assert (
+        session_append(
+            hid, sid, [ev("r1", 2, "k", put="b", clock={"r1": 2, "r2": 0})]
+        ).status_code
+        == 200
+    )
+    r = session_commit(hid, sid)
+    assert r.status_code == 200, r.text
+    assert [(e["replica_id"], e["seq"]) for e in r.json()["events"]] == [
+        ("r1", 1),
+        ("r1", 2),
+        ("r1", 3),
+    ]
+    assert session_get(hid, sid).json()["status"] == "closed"
 
 
 def test_import_session_commit_content_mismatch_with_history_is_409():

@@ -1639,6 +1639,59 @@ curl -sS "http://localhost:8000/api/histories/$HID/import-sessions/$SID/missing-
 }
 ```
 
+同样地，直接暂存一条本副本的**稀疏大序号**事件（如历史已有 `r1/1`，再暂存
+`r1/10^12`）是允许的——暂存不检查连续性；但**提交**时整批校验必须拒绝。服务端
+只按**实际存在的事件**判定连续性，绝不分配、遍历或列出 `1..10^12`，缺口以
+**闭区间**概述，因此响应体积与耗时都与缺口长度无关，也不会因展开序号区间耗尽
+内存：
+
+```bash
+# 历史已有 r1/1；会话暂存稀疏大序号 r1/10^12
+HID=$(curl -sS -X POST http://localhost:8000/api/histories \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "replica_ids": ["r1", "r2"],
+    "events": [
+      {"replica_id": "r1", "seq": 1, "key": "k", "put": "a",
+       "clock": {"r1": 1, "r2": 0}}
+    ]
+  }' | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+SID=$(curl -sS -X POST "http://localhost:8000/api/histories/$HID/import-sessions" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+
+# 暂存允许缺依赖的大序号 -> 200
+curl -sS -o /dev/null -w 'stage: %{http_code}\n' \
+  -X POST "http://localhost:8000/api/histories/$HID/import-sessions/$SID/events" \
+  -H 'Content-Type: application/json' \
+  -d '{"events": [
+    {"replica_id": "r1", "seq": 1000000000000, "key": "k", "put": "b",
+     "clock": {"r1": 1000000000000, "r2": 0}}
+  ]}'
+
+# 提交 -> 422 non_contiguous_seq，缺口为一个闭区间 [2..999999999999]
+curl -sS -i -X POST \
+  "http://localhost:8000/api/histories/$HID/import-sessions/$SID/commit"
+```
+
+```json
+{
+  "detail": [
+    {
+      "code": "non_contiguous_seq",
+      "message": "seqs for replica 'r1' must be unique and start at 1 with no gaps; got sorted seqs [1, 1000000000000] (missing closed range(s) [2..999999999999])"
+    }
+  ]
+}
+```
+
+提交失败后历史仍是 `r1/1` 一条事件、会话仍为 `open` 且暂存保留
+`r1/1000000000000`，可继续补齐后重试；缺口查询仍返回区间
+`{"replica_id": "r1", "start_seq": 2, "end_seq": 999999999999}`。小缺口同样以
+闭区间概述（如缺 seq 2 即 `missing closed range(s) [2]`，缺 4、5 即
+`[4..5]`）。共用完整批次校验的 `/api/resolve`、`/api/catchup`、
+`/api/resolve-conflict`、创建历史与 `/events` 汇入对同类稀疏输入一律返回
+**422** `non_contiguous_seq`；`seq` 仍只要求严格正整数，**没有**新增上限。
+
 ### 22. 同标识异内容：409 列出全部冲突，不返回清单
 
 暂存了一条与已提交事件同 `(replica_id, seq)` 但值不同的事件时，缺口查询返回
